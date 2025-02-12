@@ -426,6 +426,16 @@ PCODE MethodDesc::PrepareILBasedCode(PrepareCodeConfig* pConfig)
         LOG((LF_CLASSLOADER, LL_INFO1000000,
             "    In PrepareILBasedCode, calling JitCompileCode\n"));
         pCode = JitCompileCode(pConfig);
+#ifdef FEATURE_INTERPRETER
+        if (pConfig->IsInterpreterCode())
+        {
+            AllocMemTracker amt;
+            InterpreterPrecode* pPrecode = Precode::AllocateInterpreterPrecode(pCode, GetLoaderAllocator(), &amt);
+            amt.SuppressRelease();
+            pCode = PINSTRToPCODE(pPrecode->GetEntryPoint());
+            SetNativeCodeInterlocked(pCode);
+        }
+#endif // FEATURE_INTERPRETER
     }
     else
     {
@@ -1410,11 +1420,18 @@ namespace
 
         DWORD declArgCount;
         IfFailThrow(CorSigUncompressData_EndPtr(pSig1, pEndSig1, &declArgCount));
-
-        // UnsafeAccessors for fields require return types be byref.
-        // This was explicitly checked in TryGenerateUnsafeAccessor().
         if (pSig1 >= pEndSig1)
             ThrowHR(META_E_BAD_SIGNATURE);
+
+        // UnsafeAccessors for fields require return types be byref. However, we first need to
+        // consume any custom modifiers which are prior to the expected ELEMENT_TYPE_BYREF in
+        // the RetType signature (II.23.2.11).
+        _ASSERTE(state.IgnoreCustomModifiers); // We should always ignore custom modifiers for field look-up.
+        MetaSig::ConsumeCustomModifiers(pSig1, pEndSig1);
+        if (pSig1 >= pEndSig1)
+            ThrowHR(META_E_BAD_SIGNATURE);
+
+        // The ELEMENT_TYPE_BYREF was explicitly checked in TryGenerateUnsafeAccessor().
         CorElementType byRefType = CorSigUncompressElementType(pSig1);
         _ASSERTE(byRefType == ELEMENT_TYPE_BYREF);
 
@@ -1829,6 +1846,9 @@ PrepareCodeConfig::PrepareCodeConfig(NativeCodeVersion codeVersion, BOOL needsMu
     m_jitSwitchedToMinOpt(false),
 #ifdef FEATURE_TIERED_COMPILATION
     m_jitSwitchedToOptimized(false),
+#endif
+#ifdef FEATURE_INTERPRETER
+    m_isInterpreterCode(false),
 #endif
     m_nextInSameThread(nullptr)
 {}
@@ -2606,7 +2626,7 @@ extern "C" PCODE STDCALL PreStubWorker(TransitionBlock* pTransitionBlock, Method
         Thread::ObjectRefFlush(CURRENT_THREAD);
 #endif
 
-        FrameWithCookie<PrestubMethodFrame> frame(pTransitionBlock, pMD);
+        PrestubMethodFrame frame(pTransitionBlock, pMD);
         PrestubMethodFrame* pPFrame = &frame;
 
         pPFrame->Push(CURRENT_THREAD);
@@ -2682,6 +2702,20 @@ extern "C" PCODE STDCALL PreStubWorker(TransitionBlock* pTransitionBlock, Method
 
     return pbRetVal;
 }
+
+#ifdef FEATURE_INTERPRETER
+extern "C" void STDCALL ExecuteInterpretedMethod(TransitionBlock* pTransitionBlock, TADDR byteCodeAddr)
+{
+    CodeHeader* pCodeHeader = EEJitManager::GetCodeHeaderFromStartAddress(byteCodeAddr);
+
+    EEJitManager *pManager = ExecutionManager::GetEEJitManager();
+    MethodDesc *pMD = pCodeHeader->GetMethodDesc();
+
+    // TODO-Interp: call the interpreter method execution entry point
+    // Argument registers are in the TransitionBlock
+    // The stack arguments are right after the pTransitionBlock
+}
+#endif // FEATURE_INTERPRETER
 
 #ifdef _DEBUG
 //
@@ -3097,7 +3131,7 @@ EXTERN_C PCODE STDCALL ExternalMethodFixupWorker(TransitionBlock * pTransitionBl
     Thread::ObjectRefFlush(CURRENT_THREAD);
 #endif
 
-    FrameWithCookie<ExternalMethodFrame> frame(pTransitionBlock);
+    ExternalMethodFrame frame(pTransitionBlock);
     ExternalMethodFrame * pEMFrame = &frame;
 
 #if defined(TARGET_X86) || defined(TARGET_AMD64)
@@ -3549,17 +3583,6 @@ static PCODE getHelperForStaticBase(Module * pModule, CORCOMPILE_FIXUP_BLOB_KIND
     pHelper = DynamicHelpers::CreateHelper(pModule->GetLoaderAllocator(), (TADDR)pMT, CEEJitInfo::getHelperFtnStatic(helper));
 
     return pHelper;
-}
-
-TADDR GetFirstArgumentRegisterValuePtr(TransitionBlock * pTransitionBlock)
-{
-    TADDR pArgument = (TADDR)pTransitionBlock + TransitionBlock::GetOffsetOfArgumentRegisters();
-#ifdef TARGET_X86
-    // x86 is special as always
-    pArgument += offsetof(ArgumentRegisters, ECX);
-#endif
-
-    return pArgument;
 }
 
 void ProcessDynamicDictionaryLookup(TransitionBlock *           pTransitionBlock,
@@ -4049,7 +4072,7 @@ extern "C" SIZE_T STDCALL DynamicHelperWorker(TransitionBlock * pTransitionBlock
     Thread::ObjectRefFlush(CURRENT_THREAD);
 #endif
 
-    FrameWithCookie<DynamicHelperFrame> frame(pTransitionBlock, frameFlags);
+    DynamicHelperFrame frame(pTransitionBlock, frameFlags);
     DynamicHelperFrame * pFrame = &frame;
 
     pFrame->Push(CURRENT_THREAD);
